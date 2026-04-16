@@ -5,6 +5,36 @@ import tempfile
 from io import BytesIO
 
 import gradio as gr
+# Work around a Gradio schema parser bug in some envs where JSON Schema booleans
+# appear in component API info and crash the homepage route.
+try:
+    import gradio_client.utils as _gradio_client_utils
+
+    _orig_get_type = _gradio_client_utils.get_type
+    _orig_inner = _gradio_client_utils._json_schema_to_python_type
+    _orig_outer = _gradio_client_utils.json_schema_to_python_type
+
+    def _safe_get_type(schema):
+        if isinstance(schema, bool):
+            return {}
+        return _orig_get_type(schema)
+
+    def _safe_inner(schema, defs):
+        if isinstance(schema, bool):
+            return 'Any'
+        return _orig_inner(schema, defs)
+
+    def _safe_outer(schema):
+        if isinstance(schema, bool):
+            return 'Any'
+        return _orig_outer(schema)
+
+    _gradio_client_utils.get_type = _safe_get_type
+    _gradio_client_utils._json_schema_to_python_type = _safe_inner
+    _gradio_client_utils.json_schema_to_python_type = _safe_outer
+except Exception:
+    pass
+
 import numpy as np
 import torch
 import torchvision.transforms as transforms
@@ -12,7 +42,20 @@ from decord import VideoReader
 from PIL import Image, ImageDraw, ImageFont
 from transformers import AutoModel, AutoTokenizer
 
-import spaces
+# Hugging Face Spaces 的 GPU 装饰器；本地部署时通常没有该运行时，使用空实现即可。
+try:
+    import spaces  # type: ignore
+except ImportError:  # pragma: no cover
+
+    class _SpacesStub:
+        class GPU:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __call__(self, fn):
+                return fn
+
+    spaces = _SpacesStub()
 
 title_markdown = ("""
 <div style="display: flex; justify-content: flex-start; align-items: center; text-align: center;">
@@ -41,10 +84,13 @@ The service is a research preview intended for non-commercial use only, subject 
 """)
 
 
-new_path = 'Lin-Chen/ShareCaptioner-Video'
+new_path = os.environ.get(
+    "SHARECAPTIONER_MODEL_PATH", "Lin-Chen/ShareCaptioner-Video"
+)
 tokenizer = AutoTokenizer.from_pretrained(new_path, trust_remote_code=True)
 model = AutoModel.from_pretrained(
-    new_path, torch_dtype=torch.float16, trust_remote_code=True).cuda().eval()
+    new_path, torch_dtype=torch.float16, trust_remote_code=True
+).cuda().eval()
 model.cuda()
 model.tokenizer = tokenizer
 
@@ -339,4 +385,16 @@ with gr.Blocks(title='ShareCaptioner-Video', theme=gr.themes.Default(), css=bloc
     submit_btn_fc.click(generate_fastcaptioning, [video], [textbox_out])
     submit_btn_pr.click(generate_promptrecaptioning, [textbox], [textbox_out])
 
-demo.launch()
+_server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
+_server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
+_share = os.environ.get("GRADIO_SHARE", "false").lower() in ("1", "true", "yes")
+# 无桌面/无回环访问时 Gradio 会要求 share=True；无公网分享时用 _frontend=False 跳过检测。
+_gradio_frontend = os.environ.get("GRADIO_FRONTEND", "false").lower() in ("1", "true", "yes")
+demo.launch(
+    server_name=_server_name,
+    server_port=_server_port,
+    share=_share,
+    inbrowser=False,
+    show_api=False,
+    _frontend=_gradio_frontend,
+)

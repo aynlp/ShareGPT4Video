@@ -3,18 +3,21 @@ import json
 import os
 
 from lmdeploy import pipeline, ChatTemplateConfig
+from lmdeploy.messages import PytorchEngineConfig, TurbomindEngineConfig
 from lmdeploy.vl import load_image
 from lmdeploy.vl.model.utils import rewrite_ctx
 from contextlib import contextmanager
 import torch
 
 def get_image_list(video_path):
-    frames = sorted(os.listdir(video_path))
+    exts = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+    frames = sorted(
+        f for f in os.listdir(video_path)
+        if f.lower().endswith(exts) and not f.startswith(".")
+    )
     img_path_list = []
     for frame in frames:
         img_path = os.path.join(video_path, frame)
-        # NOTE lazy load image
-        # img = load_image(img_path)
         img_path_list.append(img_path)
     return img_path_list
 
@@ -45,8 +48,9 @@ def custom_forward():
         yield
 
 class VideoData():
-    def __init__(self, video_path):
+    def __init__(self, video_path, frame_interval_sec=1.0):
         self.video_path = video_path
+        self.frame_interval_sec = float(frame_interval_sec)
         self.img_path_list = get_image_list(self.video_path)
         self.frame_ptr = 0
         self.caption_list = [""]	    # hack for unified code, remember to remove the first item
@@ -60,16 +64,22 @@ class VideoData():
         if self.frame_ptr == 0:
             query = 'This is the first frame of a video, describe it in detail.'
         else:
-            query = "Here are the Video frame {} at {}.00 Second(s) and Video frame {} at {}.00 Second(s) of a video, describe what happend between them. What happend before is: {}".format(
-                self.frame_ptr, int(self.frame_ptr * 2), self.frame_ptr + 1, int((self.frame_ptr + 1) * 2), self.caption_list[-1])
+            # Align timestamps with summary_prompt: frame i (1-based) at time (i-1)*interval.
+            t0 = (self.frame_ptr - 1) * self.frame_interval_sec
+            t1 = self.frame_ptr * self.frame_interval_sec
+            query = (
+                "Here are the Video frame {} at {:.2f} Second(s) and Video frame {} at {:.2f} Second(s) "
+                "of a video, describe what happend between them. What happend before is: {}"
+            ).format(self.frame_ptr, t0, self.frame_ptr + 1, t1, self.caption_list[-1])
         self.frame_ptr += 1
         return (query, curr_img)
     
     def get_finish_data(self):
         prompt = ""
         for frame_idx, caption in enumerate(self.caption_list[1:]):
-            prompt += 'Video frame {} at {}.00 Second(s) description: {}\n'.format(
-                frame_idx+1, frame_idx*2, caption)
+            sec = frame_idx * self.frame_interval_sec
+            prompt += 'Video frame {} at {:.2f} Second(s) description: {}\n'.format(
+                frame_idx + 1, sec, caption)
         return dict(
             video_path=self.video_path,
             frame_num=len(self.img_path_list),
@@ -81,22 +91,26 @@ class VideoData():
 
 
 class VideoPool():
-    def __init__(self, pool_size=6, video_path=None):
+    def __init__(self, pool_size=6, video_path=None, frame_interval_sec=1.0):
         self.size = pool_size
+        self.frame_interval_sec = float(frame_interval_sec)
         self.video_path = json.load(open(video_path, 'r'))
         self.video_ptr = 0
-        self.video_pool = set()
+        self.video_pool = []
         self._init_pool()
 
     def _load(self):
         # load ptr video
-        video = VideoData(self.video_path[self.video_ptr])
+        video = VideoData(
+            self.video_path[self.video_ptr],
+            frame_interval_sec=self.frame_interval_sec,
+        )
         self.video_ptr += 1
         return video
 
     def get_batch_data(self):
         batch_data = []
-        for video in data_pool.video_pool:
+        for video in self.video_pool:
             data = video.get_prepared_data()
             batch_data.append(data)
         return batch_data
@@ -105,7 +119,7 @@ class VideoPool():
         while len(self.video_pool) < self.size and \
                 self.video_ptr < len(self.video_path):
             print("Load Video")
-            self.video_pool.add(self._load())
+            self.video_pool.append(self._load())
 
     def record_caption(self, caption_list):
         # put the model generation back to the video list
@@ -133,12 +147,36 @@ def parse_args():
     parser.add_argument("--videos-file", type=str, default="describe.json",
                         help="a list, each element is a string for image path")
     parser.add_argument("--save-path", type=str, default="outputs/")
+    parser.add_argument(
+        "--frame-interval-sec",
+        type=float,
+        default=1.0,
+        help="Seconds between consecutive extracted frames; must match your ffmpeg/keyframe step (e.g. fps=1 for 1s).",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("pytorch", "turbomind"),
+        default="pytorch",
+        help="pytorch: native HF weights (needed for ShareCaptioner PLoRA). turbomind: faster when supported.",
+    )
     return parser.parse_args()
 
 if __name__ == '__main__':
     args = parse_args()
-    model = pipeline(args.model_name, chat_template_config=ChatTemplateConfig(model_name='internlm-xcomposer2-4khd'))
-    data_pool = VideoPool(pool_size=args.batch_size, video_path=args.videos_file)
+    backend_cfg = (
+        PytorchEngineConfig() if args.backend == "pytorch" else TurbomindEngineConfig()
+    )
+    model = pipeline(
+        args.model_name,
+        backend_config=backend_cfg,
+        chat_template_config=ChatTemplateConfig(model_name='internlm-xcomposer2-4khd'),
+    )
+    data_pool = VideoPool(
+        pool_size=args.batch_size,
+        video_path=args.videos_file,
+        frame_interval_sec=args.frame_interval_sec,
+    )
     cnt = 0
     while True:
         batch_data = data_pool.get_batch_data()

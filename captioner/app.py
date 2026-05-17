@@ -247,6 +247,69 @@ def load_quota_video(vis_path, start=None, end=None):
     return clip_imgs
 
 
+def load_video_segments(vis_path, seg_duration_sec=2.0, frames_per_segment=4):
+    """Sample the video into fixed-length segments, each with N dense frames.
+
+    Returns a list of segments; each segment is a list of PIL.Image frames
+    sampled uniformly across its `seg_duration_sec` window.
+    """
+    vr = VideoReader(vis_path)
+    total_frame_num = len(vr)
+    fps = vr.get_avg_fps()
+    video_duration = total_frame_num / fps
+    # Include the trailing partial window if it covers >= 50% of a segment,
+    # so a 5.8s video still yields 3 segments ([1-2][3-4][5-6]).
+    full = int(video_duration // seg_duration_sec)
+    remainder = video_duration - full * seg_duration_sec
+    num_segments = full + (1 if remainder >= seg_duration_sec * 0.5 else 0)
+    num_segments = max(1, num_segments)
+    segments = []
+    for s in range(num_segments):
+        seg_start = s * seg_duration_sec
+        seg_end = (s + 1) * seg_duration_sec
+        start_f = int(seg_start * fps)
+        end_f = min(int(seg_end * fps), total_frame_num) - 1
+        if end_f <= start_f:
+            end_f = start_f
+        idxs = np.linspace(start_f, end_f, num=frames_per_segment).round().astype(int).tolist()
+        idxs = [min(max(0, i), total_frame_num - 1) for i in idxs]
+        arr = vr.get_batch(idxs).asnumpy()
+        frames = [Image.fromarray(arr[j]) for j in range(arr.shape[0])]
+        segments.append(frames)
+    return segments, num_segments
+
+
+def compose_segment_grid(frames):
+    """Compose a list of 2-4 frames into a single PIL image for model input.
+
+    - 2 frames: vertical stack (matches official pair layout)
+    - 3 frames: horizontal strip
+    - 4 frames: 2x2 grid
+    """
+    n = len(frames)
+    w, h = frames[0].size
+    gap = 20
+    if n == 1:
+        return frames[0]
+    if n == 2:
+        canvas = Image.new('RGB', (w, 2 * h + gap), 'white')
+        canvas.paste(frames[0], (0, 0))
+        canvas.paste(frames[1], (0, h + gap))
+        return canvas
+    if n == 3:
+        canvas = Image.new('RGB', (3 * w + 2 * gap, h), 'white')
+        for i, f in enumerate(frames):
+            canvas.paste(f, (i * (w + gap), 0))
+        return canvas
+    # n >= 4 -> 2x2 grid of the first 4
+    canvas = Image.new('RGB', (2 * w + gap, 2 * h + gap), 'white')
+    canvas.paste(frames[0], (0, 0))
+    canvas.paste(frames[1], (w + gap, 0))
+    canvas.paste(frames[2], (0, h + gap))
+    canvas.paste(frames[3], (w + gap, h + gap))
+    return canvas
+
+
 def resize_image(image_path, max_size=1024):
     with Image.open(image_path) as img:
         width, height = img.size
@@ -280,39 +343,41 @@ def encode_resized_image(image_path, max_size=1024):
 
 @spaces.GPU(duration=60)
 def generate_slidingcaptioning(video_path):
-    imgs = load_quota_video(video_path)
-    q = 'This is the first frame of a video, describe it in detail.'
-    query = f'[UNUSED_TOKEN_146]user\n{q}[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n'
-    img = imgs[0]
-    with torch.cuda.amp.autocast():
-        response = model_gen(model, query, img, hd_num=9)
-    print(response)
-    responses = [response]
-    images = [img]
-    for idx in range(len(imgs)-1):
-        image1 = imgs[idx]
-        image2 = imgs[idx+1]
-        prompt = "Here are the Video frame {} at {}.00 Second(s) and Video frame {} at {}.00 Second(s) of a video, describe what happend between them. What happend before is: {}".format(
-            idx, int(idx*2), idx+1, int((idx+1)*2), response)
-        width, height = image1.size
-        new_img = Image.new('RGB', (width, 2*height+50), 'white')
-        new_img.paste(image1, (0, 0))
-        new_img.paste(image2, (0, height+50))
-        query = f'[UNUSED_TOKEN_146]user\n{prompt}[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n'
+    # Dense sampling: 4 frames per 2s segment so motion-heavy moments are not lost.
+    frames_per_segment = 4
+    segments, num_segments = load_video_segments(
+        video_path, seg_duration_sec=2.0, frames_per_segment=frames_per_segment,
+    )
+    responses = []
+    prior = ""
+    for seg_idx in range(num_segments):
+        t0 = 1 + seg_idx * 2
+        t1 = 2 + seg_idx * 2
+        composite = compose_segment_grid(segments[seg_idx])
+        if seg_idx == 0:
+            q = (
+                f"Here are {frames_per_segment} frames sampled from the opening "
+                f"[{t0}s-{t1}s] segment of a video. Describe what happens in this "
+                "2-second segment in detail."
+            )
+        else:
+            q = (
+                f"Here are {frames_per_segment} frames sampled from the "
+                f"[{t0}s-{t1}s] segment of a video, describe what happens in "
+                f"this 2-second segment. What happened before is: {prior}"
+            )
+        query = f'[UNUSED_TOKEN_146]user\n{q}[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n'
         with torch.cuda.amp.autocast():
-            response = model_gen(model, query, new_img, hd_num=9)
+            response = model_gen(model, query, composite, hd_num=9)
+        print(f"[seg {seg_idx} {t0}-{t1}s]", response[:200])
         responses.append(response)
-        images.append(new_img)
-    prompt = 'Summarize the following per frame descriptions:\n'
-    for idx, txt in enumerate(responses):
-        prompt += 'Video frame {} at {}.00 Second(s) description: {}\n'.format(
-            idx+1, idx*2, txt)
-    query = f'[UNUSED_TOKEN_146]user\n{prompt}[UNUSED_TOKEN_145]\n[UNUSED_TOKEN_146]assistant\n'
-    print(query)
-    with torch.cuda.amp.autocast():
-        summ = model_gen(model, query, None, hd_num=16)
-    print(summ)
-    return summ
+        prior = response
+    lines = []
+    for i, txt in enumerate(responses):
+        t0 = 1 + i * 2
+        t1 = 2 + i * 2
+        lines.append(f"[{t0}s-{t1}s] {txt.strip()}")
+    return "\n\n".join(lines)
 
 
 @spaces.GPU(duration=60)

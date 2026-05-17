@@ -61,29 +61,45 @@ class VideoData():
     
     def get_prepared_data(self,):
         curr_img = load_image(self.img_path_list[self.frame_ptr])
+        t0 = 1 + self.frame_ptr * self.frame_interval_sec
+        t1 = 2 + self.frame_ptr * self.frame_interval_sec
         if self.frame_ptr == 0:
-            query = 'This is the first frame of a video, describe it in detail.'
-        else:
-            # Align timestamps with summary_prompt: frame i (1-based) at time (i-1)*interval.
-            t0 = (self.frame_ptr - 1) * self.frame_interval_sec
-            t1 = self.frame_ptr * self.frame_interval_sec
             query = (
-                "Here are the Video frame {} at {:.2f} Second(s) and Video frame {} at {:.2f} Second(s) "
-                "of a video, describe what happend between them. What happend before is: {}"
-            ).format(self.frame_ptr, t0, self.frame_ptr + 1, t1, self.caption_list[-1])
+                "Write a prestige-documentary-style shot description for the opening "
+                "segment labeled [{:.0f}s-{:.0f}s]. Output ONE continuous paragraph "
+                "covering densely and concretely: subject action and appearance, shot "
+                "type and camera movement, lighting quality and color palette, depth "
+                "of field and atmosphere, mood and genre framing; use '->' arrows for "
+                "causal beats where helpful. "
+                "Do NOT output any time bracket prefix. Target 70-150 words."
+            ).format(t0, t1)
+        else:
+            query = (
+                "Write a prestige-documentary-style shot description for the segment "
+                "labeled [{:.0f}s-{:.0f}s] (frame {} -> frame {}). Output ONE continuous "
+                "paragraph covering densely and concretely: subject action and appearance "
+                "(keep continuity with the prior segment), shot type and camera movement, "
+                "lighting quality and color palette, depth of field and atmosphere, mood "
+                "and genre framing; use '->' arrows for causal beats where helpful. "
+                "Do NOT output any time bracket prefix. Do NOT restate prior-segment text. "
+                "Target 70-150 words. Prior segment: {}"
+            ).format(t0, t1, self.frame_ptr, self.frame_ptr + 1, self.caption_list[-1])
         self.frame_ptr += 1
         return (query, curr_img)
     
     def get_finish_data(self):
-        prompt = ""
-        for frame_idx, caption in enumerate(self.caption_list[1:]):
-            sec = frame_idx * self.frame_interval_sec
-            prompt += 'Video frame {} at {:.2f} Second(s) description: {}\n'.format(
-                frame_idx + 1, sec, caption)
+        def _fmt(t):
+            return str(int(t)) if t == int(t) else f"{t:g}"
+        segments = []
+        for idx, caption in enumerate(self.caption_list[1:], start=1):
+            t0 = 1 + (idx - 1) * self.frame_interval_sec
+            t1 = 2 + (idx - 1) * self.frame_interval_sec
+            segments.append(f"[{_fmt(t0)}s-{_fmt(t1)}s] {caption.strip()}")
+        timeline = "\n\n".join(segments)
         return dict(
             video_path=self.video_path,
             frame_num=len(self.img_path_list),
-            summary_prompt=prompt
+            timeline=timeline,
         )
     
     def record_caption(self, caption):
@@ -188,12 +204,7 @@ if __name__ == '__main__':
         data_pool.record_caption(responses)
         finish_list = data_pool.check_finished_video()
         cnt += 1
-        if len(finish_list) == 0:
-            continue
-        batch_infer_list = [(data['summary_prompt']) for data in finish_list]
-        final_responses = model(batch_infer_list)
-        for finish_data, finish_response in zip(finish_list, final_responses):
-            finish_data['summary_prompt'] = finish_response.text
+        for finish_data in finish_list:
             filename = finish_data['video_path'].split('/')[-1]
             with open(os.path.join(args.save_path, filename+'.json'), 'w') as f:
                 f.write(json.dumps(finish_data, indent=2, ensure_ascii=False))

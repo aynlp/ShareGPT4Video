@@ -24,10 +24,11 @@ from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
 from llava.constants import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                              DEFAULT_IMAGE_PATCH_TOKEN)
 from llava.model import *
-from llava.train.train import smart_tokenizer_and_embedding_resize
 
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, lora_alpha=None, **kwargs):
+    # Lazy import to avoid pulling in the trainer module chain (peft compat issue)
+    from llava.train.train import smart_tokenizer_and_embedding_resize
     kwargs = {"device_map": device_map, **kwargs}
 
     if device != "cuda":
@@ -109,17 +110,17 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     shutil.copyfile(os.path.join(model_base, 'configuration_mpt.py'), os.path.join(
                         model_path, 'configuration_mpt.py'))
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_base, use_fast=True)
+                    model_base, use_fast=True, trust_remote_code=True)
                 cfg_pretrained = AutoConfig.from_pretrained(
                     model_path, trust_remote_code=True)
                 model = LlavaMptForCausalLM.from_pretrained(
-                    model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+                    model_base, low_cpu_mem_usage=True, config=cfg_pretrained, trust_remote_code=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_base, use_fast=False)
-                cfg_pretrained = AutoConfig.from_pretrained(model_path)
+                    model_base, use_fast=False, trust_remote_code=True)
+                cfg_pretrained = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
                 model = LlavaLlamaForCausalLM.from_pretrained(
-                    model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
+                    model_base, low_cpu_mem_usage=True, config=cfg_pretrained, trust_remote_code=True, **kwargs)
 
             mm_projector_weights = torch.load(os.path.join(
                 model_path, 'mm_projector.bin'), map_location='cpu')
@@ -129,22 +130,24 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         else:
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, use_fast=True)
+                    model_path, use_fast=True, trust_remote_code=True)
                 model = LlavaMptForCausalLM.from_pretrained(
-                    model_path, low_cpu_mem_usage=True, **kwargs)
+                    model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
             elif 'mistral' in model_name.lower():
-                tokenizer = AutoTokenizer.from_pretrained(model_path)
+                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
                 model = LlavaMistralForCausalLM.from_pretrained(
                     model_path,
                     low_cpu_mem_usage=True,
+                    trust_remote_code=True,
                     **kwargs
                 )
             else:
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, use_fast=False)
+                    model_path, use_fast=False, trust_remote_code=True)
                 model = LlavaLlamaForCausalLM.from_pretrained(
                     model_path,
                     low_cpu_mem_usage=True,
+                    trust_remote_code=True,
                     **kwargs
                 )
     else:
@@ -153,9 +156,9 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             # PEFT model
             from peft import PeftModel
             tokenizer = AutoTokenizer.from_pretrained(
-                model_base, use_fast=False)
+                model_base, use_fast=False, trust_remote_code=True)
             model = AutoModelForCausalLM.from_pretrained(
-                model_base, low_cpu_mem_usage=True, **kwargs)
+                model_base, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
             print(f"Loading LoRA weights from {model_path}")
             model = PeftModel.from_pretrained(model, model_path)
             print(f"Merging weights")
@@ -171,7 +174,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     model_path, low_cpu_mem_usage=True, trust_remote_code=True, **kwargs)
             else:
                 tokenizer = AutoTokenizer.from_pretrained(
-                    model_path, use_fast=False)
+                    model_path, use_fast=False, trust_remote_code=True)
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path, low_cpu_mem_usage=True, **kwargs)
 
@@ -190,6 +193,11 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True)
 
         vision_tower = model.get_vision_tower()
+        if vision_tower is None:
+            mm_vt = getattr(model.model.config, 'mm_vision_tower', None) or getattr(model.config, 'mm_vision_tower', None)
+            if mm_vt:
+                model.initialize_vision_tokenizer(mm_vt, delay_load=False)
+                vision_tower = model.get_vision_tower()
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
         if device_map != 'auto':

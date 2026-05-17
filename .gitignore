@@ -22,6 +22,14 @@ dist
 wandb
 output
 
+# Secrets and local env
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+.git-credentials
+
 checkpoints
 ckpts*
 
